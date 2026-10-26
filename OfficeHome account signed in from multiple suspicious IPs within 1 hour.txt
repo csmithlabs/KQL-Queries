@@ -1,0 +1,47 @@
+// ---------------------------------------------------------------
+// RULE NAME:   OfficeHome - Account Hopping Across Suspicious IPs (Unmanaged Device)
+// ALERT TITLE: OfficeHome account signed in from multiple suspicious IPs within 1 hour
+// SEVERITY:    Medium (alert-only tripwire, no automated actions)
+// CATEGORY:    Initial access
+// SCHEDULE:    Hourly, 4-hour lookback (no time filter in the query)
+// COMPANION:   OfficeHome - Compromised Sign-In (Proxy/VPN or High Risk, Unmanaged Device)
+//
+// Detect OfficeHome account hopping (repeat-access tripwire)
+// Flags successful sign-ins from unmanaged devices where the same
+// account signs in from a DIFFERENT suspicious IP within 1 hour of its
+// previous suspicious sign-in. "Suspicious" means the IP is a flagged
+// anonymizing proxy/VPN or the sign-in risk was medium or higher.
+// Possible attacker re-entry or IP rotation after initial compromise.
+// ---------------------------------------------------------------
+
+// STEP 1: Build a lookup of IP addresses that Defender for Cloud Apps
+// has flagged as anonymous proxies/VPNs. One row per IP, marked AnonymousIP = true.
+let AnonIPs = CloudAppEvents
+    | where tostring(IsAnonymousProxy) in ("1", "true", "True")   // tostring handles bool or int storage
+    | summarize by IPAddress
+    | extend AnonymousIP = true;
+// STEP 2: Start from Entra sign-in events and narrow to the sign-ins we care about
+EntraIdSignInEvents
+| where ApplicationId == "4765445b-32c6-49b0-83e6-1d93765276ca"   // OfficeHome app
+| where ErrorCode == 0                                             // successful sign-ins only
+| where IsManaged != "1"                                           // device is not Entra-managed
+// STEP 3: Mark each sign-in whose IP is a flagged proxy/VPN.
+// leftouter keeps every sign-in, even when the IP isn't in the lookup.
+| join kind=leftouter AnonIPs on IPAddress
+// STEP 4: Keep only suspicious sign-ins. Either condition qualifies:
+//   - the IP is a flagged anonymous proxy/VPN
+//   - the real-time risk score during sign-in was medium or higher (50 or 100)
+| where AnonymousIP == true or RiskLevelDuringSignIn >= 50
+// STEP 5: Put each account's suspicious sign-ins in time order, then look at the
+// row just before each one. sort makes the table "serialized", which prev() requires.
+| sort by AccountObjectId asc, Timestamp asc
+| extend PrevIP = prev(IPAddress), PrevTime = prev(Timestamp), PrevAcct = prev(AccountObjectId)
+// STEP 6: Keep a sign-in only if the previous row is the same account, came from a
+// different IP, and happened within the last hour. This is the "hopping" signal.
+// Bin-based hourly grouping is avoided on purpose: it can split two sign-ins
+// 40 minutes apart into different hours and miss them.
+| where AccountObjectId == PrevAcct and IPAddress != PrevIP and Timestamp - PrevTime <= 1h
+// STEP 7: Final column order. Timestamp, ReportId and AccountObjectId are required by
+// custom detections. PrevIP shows where the account hopped from.
+| project Timestamp, ReportId, AccountObjectId, AccountUpn, IPAddress, PrevIP, Country, State,
+          RiskLevelDuringSignIn, RiskLevelAggregated, UserAgent, SessionId, CorrelationId
