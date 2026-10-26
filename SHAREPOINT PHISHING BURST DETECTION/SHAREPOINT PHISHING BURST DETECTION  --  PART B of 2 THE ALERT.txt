@@ -1,0 +1,242 @@
+// ============================================================================
+// SHAREPOINT PHISHING BURST DETECTION  --  PART B of 2  THE ALERT
+// ============================================================================
+//
+// WHAT THIS DETECTS
+//   Phishing emails sent from the SharePoint notification address
+//   (no-reply@sharepointonline.com) that contain a link to a SharePoint site
+//   that is NOT ours (an address like SOMETHING-my.sharepoint.com).
+//   Only that sender is examined. Mail from any other sender is ignored.
+//   Two subject formats are understood:
+//       NAME shared "DOCUMENT" with you                       (English)
+//       NAME is inviting you to collaborate on DOCUMENT       (English)
+//       NAME te invita a colaborar en DOCUMENT                (Spanish, and
+//                                                              close variants)
+//   One of these emails is normal. Many people receiving the same pattern
+//   within an hour is not.
+//
+//   Attackers change the pattern, so we watch three different things
+//   (called "group keys" below) and count how many different people
+//   received emails for each one:
+//     1. HOST   - the same outside SharePoint site linked in many emails
+//                 (works even when names and documents are all different,
+//                 and even when the subject matches neither format)
+//     2. DOC    - the same document name sent to many people
+//                 (works even when the sharer name changes)
+//     3. SHARER - the same person "sharing" or "inviting" with 2 or more
+//                 different documents to many people
+//
+//   Links to static2.sharepointonline.com are ignored. They are just
+//   formatting images in the email, not the phishing link.
+//
+// THIS IS ONE OF TWO RULES, AND YOU NEED BOTH
+//   PART A (separate rule) - THE CLEANER
+//     Returns ONE ROW PER EMAIL that reached an inbox. Runs with the
+//     "Soft delete email" action turned on, so the emails are removed from
+//     mailboxes automatically with no human needed.
+//
+//   PART B (this rule) - THE ALERT
+//     Returns ONE ROW PER BURST, written for a human to read. It has NO
+//     automatic action. It tells the analyst how many people got the email,
+//     how many reached the inbox vs. were blocked, and WHICH SHAREPOINT HOST
+//     to add to the Tenant Allow/Block List (a manual step).
+//
+//   HOW THEY RELATE
+//     Steps 0 to 6 below are IDENTICAL in both rules, so both rules always
+//     agree on what counts as a burst. They only differ in the very last
+//     step (Step 7): A lists the individual emails, B summarizes the burst.
+//
+//   WHY BOTH ARE NEEDED
+//     - Part A alone: emails disappear quietly, but nobody is told, nobody
+//       blocks the SharePoint site, and the attacker simply keeps sending.
+//     - Part B alone: a human is told, but the phishing emails keep sitting
+//       in inboxes until someone cleans them up by hand.
+//     Together: A removes the mail right away, B tells a person what to
+//     block so it stops coming back.
+//
+//   KEEP THEM IN SYNC: if you change anything in Steps 0 to 6 here, make
+//   the same change in Part A.
+//
+// BLOCKED / QUARANTINED EMAILS
+//   Every email counts toward the thresholds, even ones that were blocked,
+//   quarantined or sent to junk. That way an attacker reusing a SharePoint
+//   site we already blocked is still seen. But we only ALERT or ACT when at
+//   least one email actually reached an inbox. If everything was already
+//   stopped, there is nothing to do, so no row is returned.
+//
+// SCHEDULE AND SETUP
+//   - Run every 4 hours with a 4 hour lookback (set in the rule settings).
+//   - There is no time filter in this query ON PURPOSE. The rule schedule
+//     decides how far back it looks.
+//   - Edit InternalSharePointDomains in Step 0 to list OUR SharePoint sites.
+//   - This rule has NO automatic actions. Keep it that way.
+//   - This is a scheduled rule. It cannot be a near-real-time rule.
+//
+// SUGGESTED ALERT SETTINGS (rule wizard)
+//   Title:        SharePoint phishing burst ({{GroupKeyType}})
+//   Description:  {{Evidence}}
+//   Custom details: Hosts, SampleUrls, SampleSubjects, Recipients,
+//                   DeliveredRecipients, NotDelivered, QualifyingWindowCount
+//   Entities:     map NetworkMessageId + RecipientEmailAddress
+// ============================================================================
+// ---------------------------------------------------------------------------
+// STEP 0: SETTINGS (the only things you normally need to change)
+// ---------------------------------------------------------------------------
+// A burst is flagged when this many DIFFERENT people received matching
+// emails inside one 1-hour window.
+let DocThreshold = 20;      // same document name sent to this many people
+let SharerThreshold = 20;   // same sharer (2+ different docs) sent to this many
+let HostThreshold = 20;     // same outside SharePoint site linked to this many
+// OUR OWN SharePoint sites. Links to these are normal and are ignored.
+// Add any partner or affiliated sites you trust. Lowercase, no https://
+let InternalSharePointDomains = dynamic([
+    "coloradomtn.sharepoint.com",
+    "coloradomtn-my.sharepoint.com"
+]);
+// ---------------------------------------------------------------------------
+// STEP 1: FIND EMAILS THAT LINK TO AN OUTSIDE ONEDRIVE / SHAREPOINT SITE
+// ---------------------------------------------------------------------------
+// EmailUrlInfo lists every link found in every email. We keep only links to
+// "-my.sharepoint.com" sites that are not ours.
+// (static2.sharepointonline.com does not end in "-my.sharepoint.com", so
+// those formatting links are automatically left out.)
+// An email can have many links, so we boil it down to one row per email:
+// the outside site (ExtHost) and one example link (SampleUrl).
+let ExternalMyLinks =
+    EmailUrlInfo
+    | extend UrlDomain = tolower(UrlDomain)
+    | where UrlDomain endswith "-my.sharepoint.com"
+    | where UrlDomain !in (InternalSharePointDomains)
+    | summarize ExtHost = take_any(UrlDomain), SampleUrl = take_any(Url) by NetworkMessageId;
+// ---------------------------------------------------------------------------
+// STEP 2: GET THE EMAILS AND PULL THE NAME AND DOCUMENT OUT OF THE SUBJECT
+// ---------------------------------------------------------------------------
+let EmailRows =
+    EmailEvents
+    // Only mail coming in from outside our organization
+    | where EmailDirection == "Inbound"
+    // ONLY the SharePoint notification address. Everything else is ignored.
+    | where SenderFromAddress =~ "no-reply@sharepointonline.com"
+    // Keep only emails from Step 1 (those with an outside SharePoint link)
+    | join kind=inner ExternalMyLinks on NetworkMessageId
+    // One row per email per recipient (removes duplicate event records)
+    | summarize arg_max(Timestamp, *) by NetworkMessageId, RecipientEmailAddress
+    // Sharer = the NAME at the start of the subject. We try two formats and
+    // use whichever matches (coalesce = "first one that is not empty"):
+    //   Format 1:  John Smith shared "Budget" with you
+    //   Format 2:  John Smith is inviting you to collaborate on Budget
+    //              (or Spanish: John Smith te invita a colaborar en Budget)
+    //   Both give: John Smith
+    // The odd-looking [\x22\x27...] means "any kind of quote mark":
+    // straight double, straight single, or curly quotes.
+    | extend Sharer = trim(@"\s", coalesce(
+        extract(@"(?i)^(.+?)\s+shared\s+[\x22\x27\x{201C}\x{2018}]", 1, Subject),
+        extract(@"(?i)^(.+?)\s+(?:is\s+inviting\s+you\s+to\s+collaborate\s+on|(?:te\s+|le\s+)?(?:est[aá]\s+invitando|invita|ha\s+invitado)\s+a\s+colaborar\s+(?:en|sobre))\s+", 1, Subject)))
+    // DocName = the document name. Same two formats:
+    //   Format 1: the text between the quote marks, before "with you"
+    //   Format 2: everything after "collaborate on" / "colaborar en"
+    //             (quote marks around it are optional and are removed)
+    //   Both give: Budget
+    | extend DocName = trim(@"\s", coalesce(
+        extract(@"(?i)\s+shared\s+[\x22\x27\x{201C}\x{2018}](.+)[\x22\x27\x{201D}\x{2019}]\s+with you\s*$", 1, Subject),
+        extract(@"(?i)\s+(?:is\s+inviting\s+you\s+to\s+collaborate\s+on|(?:te\s+|le\s+)?(?:est[aá]\s+invitando|invita|ha\s+invitado)\s+a\s+colaborar\s+(?:en|sobre))\s+[\x22\x27\x{201C}\x{2018}]?(.+?)[\x22\x27\x{201D}\x{2019}]?\s*$", 1, Subject)))
+// ---------------------------------------------------------------------------
+// STEP 3: DID THE EMAIL ACTUALLY REACH AN INBOX?
+// ---------------------------------------------------------------------------
+    // Delivered = true only if it landed in the inbox. Junk, Quarantine,
+    // Blocked and so on are false.
+    // (To also treat the Junk folder as delivered, change the line below to:
+    //  DeliveryLocation in ("Inbox/folder", "Junk folder") )
+    | extend Delivered = DeliveryLocation == "Inbox/folder"
+    // DeliveredTs = the arrival time, but only for inbox emails
+    | extend DeliveredTs = iff(Delivered, Timestamp, datetime(null))
+// ---------------------------------------------------------------------------
+// STEP 4: PUT EACH EMAIL INTO OVERLAPPING 1-HOUR WINDOWS
+// ---------------------------------------------------------------------------
+// Counting in fixed hours (10:00-11:00, 11:00-12:00) can split a burst in
+// half at the boundary and miss it. So we use 1-hour windows that start
+// every 10 minutes (10:00, 10:10, 10:20 ...). An email belongs to the six
+// windows that contain it. Counts are done separately per window and are
+// never added across windows.
+    | extend BaseWindow = bin(Timestamp, 10m)    // round the time down to the last 10 minutes
+    | extend WindowStarts = pack_array(
+        BaseWindow,                 // window starting at this 10 minute mark
+        BaseWindow - 10m,           // ...and the five windows that started
+        BaseWindow - 20m,           //    earlier but still include this email
+        BaseWindow - 30m,
+        BaseWindow - 40m,
+        BaseWindow - 50m)
+    // mv-expand turns the list of 6 window start times into 6 separate
+    // rows, one copy of the email per window.
+    | mv-expand WindowStart = WindowStarts to typeof(datetime)
+// ---------------------------------------------------------------------------
+// STEP 5: LABEL EACH EMAIL WITH THE THREE THINGS WE COUNT ("GROUP KEYS")
+// ---------------------------------------------------------------------------
+// Each key is a label like "Host|something-my.sharepoint.com",
+// "Doc|Budget" or "Sharer|John Smith". Later we count how many different
+// people received emails under each label.
+    | extend GroupKeys = pack_array(
+        strcat("Host|", ExtHost),
+        iff(isnotempty(DocName), strcat("Doc|", DocName), ""),
+        iff(isnotempty(Sharer), strcat("Sharer|", Sharer), ""))
+    // Again, one row per label (so each email now appears once per label per
+    // window), then drop the empty labels.
+    | mv-expand GroupKey = GroupKeys to typeof(string)
+    | where isnotempty(GroupKey);
+// ---------------------------------------------------------------------------
+// STEP 6: COUNT PEOPLE PER LABEL PER WINDOW AND APPLY THE THRESHOLDS
+// ---------------------------------------------------------------------------
+let QualifyingWindows =
+    EmailRows
+    | summarize
+        Recipients = dcount(RecipientEmailAddress),                          // different people, ALL delivery results
+        DeliveredRecipients = dcountif(RecipientEmailAddress, Delivered),    // different people whose mail reached an inbox
+        DistinctDocs = dcountif(DocName, isnotempty(DocName))                // different documents
+        by GroupKey, WindowStart
+    // GroupKeyType = "Host", "Doc" or "Sharer" (the part before the "|")
+    | extend GroupKeyType = tostring(split(GroupKey, "|")[0])
+    // Alert or act ONLY if at least one email reached an inbox
+    | where DeliveredRecipients > 0
+    // Apply the right threshold for each kind of label
+    | where (GroupKeyType == "Doc" and Recipients >= DocThreshold)
+        or (GroupKeyType == "Sharer" and Recipients >= SharerThreshold and DistinctDocs >= 2)
+        or (GroupKeyType == "Host" and Recipients >= HostThreshold);
+// ---------------------------------------------------------------------------
+// STEP 7 (PART B ONLY): ONE READABLE ALERT ROW PER BURST
+// ---------------------------------------------------------------------------
+// This is the part that differs from Part A. We want ONE row per burst
+// (not one per email), with the facts a human needs.
+QualifyingWindows
+// 7a. A burst can qualify in many overlapping windows. Keep only the
+//     STRONGEST window (most people) for each label, and count how many
+//     windows qualified (a rough measure of how long the burst lasted).
+| summarize
+    arg_max(Recipients, WindowStart, DeliveredRecipients, DistinctDocs, GroupKeyType),
+    QualifyingWindowCount = count()
+    by GroupKey
+// 7b. Bring back the actual emails from that strongest window...
+| join kind=inner EmailRows on GroupKey, WindowStart
+// 7c. ...and boil them down to ONE row, using one inbox email as the
+//     example (so the alert maps to a real email), plus samples of the
+//     hosts, links and subjects involved.
+| summarize
+    arg_max(DeliveredTs, ReportId, NetworkMessageId, RecipientEmailAddress, SenderFromAddress, Subject),
+    Hosts = make_set(ExtHost, 5),          // SharePoint sites to consider blocking
+    SampleUrls = make_set(SampleUrl, 3),
+    SampleSubjects = make_set(Subject, 5)
+    by GroupKey, WindowStart, Recipients, DeliveredRecipients, DistinctDocs, GroupKeyType, QualifyingWindowCount
+// 7d. The alert needs a Timestamp column. Use the inbox email's arrival time.
+| extend Timestamp = DeliveredTs
+// 7e. Approximate number of people whose copy was blocked, quarantined, etc.
+| extend NotDelivered = Recipients - DeliveredRecipients
+// 7f. A plain-English summary line for the alert description
+| extend Evidence = strcat(GroupKeyType, " '", substring(GroupKey, strlen(GroupKeyType) + 1), "' reached ",
+    tostring(Recipients), " recipients in a 1-hour window (", tostring(DeliveredRecipients),
+    " delivered to inbox, about ", tostring(NotDelivered),
+    " blocked, quarantined or otherwise not delivered). Hosts to review for the Tenant Allow/Block List: ",
+    strcat_array(Hosts, ", "))
+// Columns the rule needs: Timestamp, ReportId, NetworkMessageId and
+// RecipientEmailAddress, plus everything the analyst should see
+| project Timestamp, ReportId, NetworkMessageId, RecipientEmailAddress,
+    SenderFromAddress, Subject, GroupKeyType, GroupKey, WindowStart, Recipients, DeliveredRecipients,
+    NotDelivered, DistinctDocs, QualifyingWindowCount, Hosts, SampleUrls, SampleSubjects, Evidence
